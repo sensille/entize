@@ -1,0 +1,19 @@
+[package]
+name = "ent-bpf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+blazesym = "0.2.1"
+elf = "0.8.0"
+env_logger = "0.11.8"
+libbpf-rs = "0.25.0"
+libc = "0.2.178"
+log = "0.4.29"
+entize = { path = "../entize" }
+
+[build-dependencies]
+libbpf-cargo = "0.25.0"
+vmlinux = { git = "https://github.com/libbpf/vmlinux.h.git", rev = "83a228cf37fc65f2d14e4896a04922b5ee531a94" }
+

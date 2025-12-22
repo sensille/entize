@@ -1,0 +1,17 @@
+[package]
+name = "entize-c"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["staticlib"]
+rustflags = "-Clink-arg=-Wl,-soname=libentize.so.0"
+
+[build]
+rustflags = "-Clink-arg=-Wl,-soname=libentize.so.0"
+
+[dependencies]
+entize = { path = "../entize" }
+
+[build-dependencies]
+cbindgen = "0.29"
