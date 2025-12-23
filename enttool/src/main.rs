@@ -13,10 +13,11 @@ fn main() -> Result<()> {
     */
     let pid = 4504;
     //ent.add_file("/usr/lib/firefox/libxul.so")?;
-    ent.add_pid(pid)?;
-    ent.build_tables()?;
-    let res = ent.lookup(pid, 0x7cd5da39a1cb);
-    println!("{:?}", res);
+    ent.add_pid(pid, &|_t, _k, _v| {
+        Ok(())
+    })?;
+    //let res = ent.lookup(pid, 0x7cd5da39a1cb);
+    //println!("{:?}", res);
 
     Ok(())
 }

@@ -95,10 +95,6 @@ fn main() -> Result<()> {
 
     let mut ent = entize::Ent::new();
 
-    ent.add_pid(pid)?;
-    let (mut tables, entries, expressions) = ent.build_tables()?;
-    let mappings = ent.build_mapping_for_pid(pid)?;
-
     let mut skel_builder = EntSkelBuilder::default();
     skel_builder.obj_builder.debug(true);
 
@@ -116,32 +112,28 @@ fn main() -> Result<()> {
     rodata.targ_pid = pid;
 
     // set map sizes
-    open_skel.maps.offsetmaps.set_max_entries(tables.len()  as u32)?;
+    open_skel.maps.offsetmaps.set_max_entries(1000)?;
     open_skel.maps.mappings.set_max_entries(1)?;
-    open_skel.maps.cfts.set_max_entries(entries.len() as u32)?;
-    open_skel.maps.expressions.set_max_entries(expressions.len() as u32)?;
+    open_skel.maps.cfts.set_max_entries(10000)?;
+    open_skel.maps.expressions.set_max_entries(100)?;
 
     let mut skel = open_skel.load()
         .context("failed to load ENT skel")?;
 
-    // build offsets tables
-    for (i, table) in tables.iter_mut().enumerate() {
-        skel.maps.offsetmaps.update(&(i as u32).to_le_bytes(), &table, MapFlags::ANY)?;
-    }
-
-    // build mappings table
-    skel.maps.mappings.update(&(pid as u32).to_le_bytes(), &mappings, MapFlags::ANY)?;
-
-    // build CFT table
-    for (i, table) in entries.iter().enumerate() {
-        skel.maps.cfts.update(&(i as u32).to_le_bytes(), &table, MapFlags::ANY)?;
-    }
-
-    // build expressions table
-    for (i, table) in expressions.iter().enumerate() {
-        println!("setting expr {} len {}", i, table.len());
-        skel.maps.expressions.update(&(i as u32).to_le_bytes(), &table, MapFlags::ANY)?;
-    }
+    ent.add_pid(pid, &|table, key, value| {
+println!("Adding to table {:?} key {} value len {}", table, key, value.len());
+        let tab = match table {
+            entize::TableType::UnwindTable => &skel.maps.offsetmaps,
+            entize::TableType::UnwindEntries => &skel.maps.cfts,
+            entize::TableType::Expressions => &skel.maps.expressions,
+            entize::TableType::Mappings => &skel.maps.mappings,
+        };
+        let res = tab.update(&key.to_le_bytes(), value, MapFlags::ANY);
+        if res.is_err() {
+            return Err(entize::EntError::CallbackFailed);
+        }
+        Ok(())
+    })?;
 
     let pefds = init_perf(7, false)
         .context("failed to initialize perf monitor")?;

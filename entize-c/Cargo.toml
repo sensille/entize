@@ -5,10 +5,6 @@ edition = "2024"
 
 [lib]
 crate-type = ["staticlib"]
-rustflags = "-Clink-arg=-Wl,-soname=libentize.so.0"
-
-[build]
-rustflags = "-Clink-arg=-Wl,-soname=libentize.so.0"
 
 [dependencies]
 entize = { path = "../entize" }

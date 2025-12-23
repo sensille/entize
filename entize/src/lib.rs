@@ -3,11 +3,14 @@ use gimli::UnwindSection;
 use thiserror::Error;
 use std::collections::{ HashMap, BTreeMap };
 use log::{ debug, info, warn };
+use std::ffi::OsString;
+
+mod table;
 
 const NUM_REGISTERS: usize = 17; // r0 - r15 + pc
 const CFT_ENTRY_SIZE: usize = 228;
 const MAX_MAPPINGS: usize = 1000;
-mod table;
+const CHUNK_SIZE: usize = 256 * 1024; // 256 KB per eBPF map entry
 
 #[derive(Error, Debug)]
 pub enum EntError {
@@ -43,11 +46,24 @@ pub enum EntError {
     PidNotFound,
     #[error("Unexpected object type, expected ELF")]
     UnexpectedObjectType,
+    #[error("Callback function failed")]
+    CallbackFailed,
 
 }
 use EntError::*;
 
-type Result<T> = std::result::Result<T, EntError>;
+#[derive(Debug, Clone, Copy)]
+pub enum TableType {
+    UnwindTable = 1,
+    UnwindEntries = 2,
+    Expressions = 3,
+    Mappings = 4,
+}
+
+pub type Result<T> = std::result::Result<T, EntError>;
+// table_type: i32, key: u32, value: &[u8] -> result: i32;
+pub trait Callback: Fn(TableType, u32, &[u8]) -> Result<()> {}
+impl<T> Callback for T where T: Fn(TableType, u32, &[u8]) -> Result<()> {}
 
 /*
 #[derive(Debug)]
@@ -60,16 +76,16 @@ struct EvaluationContext {
 
 #[derive(Debug)]
 pub struct Ent {
-    unwind_tables: Vec<BTreeMap<u64, Option<usize>>>,
-    unwind_entries: BTreeMap<usize, Vec<u8>>,
-    unwind_entry_counts: Vec<usize>,
+    next_oid: usize,
+    next_entry_id: usize,
+    next_expression_id: usize,
+    current_table_id: usize,
     unwind_entries_rev: BTreeMap<Vec<u8>, usize>,
-    expressions: BTreeMap<usize, Vec<u8>>,  // XXX needed? only rev?
     expressions_rev: BTreeMap<Vec<u8>, usize>,
     total_eh_frame_size: usize,
     table_mappings: HashMap<usize, Vec<(u64, usize, usize)>>, // oid -> ( table id, offset)
-    pid_map: HashMap<u32, Vec<ProcessMap>>, // pid -> maps
-    files_seen: HashMap<String, Option<usize>>, // file path -> oid
+    files_seen: HashMap<OsString, Option<usize>>, // file path -> oid
+    current_table: Vec<u8>,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -83,28 +99,37 @@ pub enum ParsingError {
 impl Ent {
     pub fn new() -> Self {
         Ent {
-            unwind_tables: Vec::new(),
-            unwind_entries: BTreeMap::new(),
+            next_oid: 0,
+            next_entry_id: 1, // entry id 0 means no unwind info
+            next_expression_id: 0,
+            current_table_id: 0,
             unwind_entries_rev: BTreeMap::new(),
-            unwind_entry_counts: Vec::new(),
-            expressions: BTreeMap::new(),
             expressions_rev: BTreeMap::new(),
             total_eh_frame_size: 0,
             table_mappings: HashMap::new(),
-            pid_map: HashMap::new(),
             files_seen: HashMap::new(),
+            current_table: Vec::new(),
         }
     }
 
-    // oid object id must be unique
-    pub fn add_file<P: AsRef<std::path::Path>>(&mut self, path: P)
-        -> Result<(usize, HashMap<ParsingError, u64>)>
+
+    // returns (oid, parsing errors, unwind_table)
+    // the returned unwind table is normally not needed, it is returned
+    // so that it is possible to easily build a lookup tool
+    // to aid in debugging
+    fn add_new_file<P: AsRef<std::path::Path>, F: Callback>(&mut self, path: P, cb: &F)
+        -> Result<(usize, HashMap<ParsingError, u64>, BTreeMap<u64, Option<usize>>)>
     {
-        let oid = self.unwind_tables.len();
+        let oid = self.next_oid;
         if oid == u16::MAX as usize {
             return Err(TooManyObjects);
         }
-        let file = std::fs::File::open(path).map_err(FileOpenError)?;
+        if oid == 0 {
+            // first time here, add empty unwind entry at id 0
+            cb(TableType::UnwindEntries, 0, &[0u8; CFT_ENTRY_SIZE])?;
+        }
+        self.next_oid += 1;
+        let file = std::fs::File::open(&path).map_err(FileOpenError)?;
 
         let mmap = unsafe { memmap2::Mmap::map(&file).map_err(MmapError)? };
         let object = object::File::parse(&*mmap).map_err(ObjectParseError)?;
@@ -187,7 +212,7 @@ impl Ent {
                                     break 'rows;
                                 }
                                 let expr_id = self.add_expression(Vec::from(&eh_frame_data
-                                    [e.offset .. e.offset + e.length]));
+                                    [e.offset .. e.offset + e.length]), cb)?;
                                 let expr_id = expr_id as u32;
                                 s.extend_from_slice(&2u32.to_le_bytes());
                                 s.extend_from_slice(&expr_id.to_le_bytes());
@@ -228,7 +253,7 @@ impl Ent {
                                         break 'rows;
                                     }
                                     let expr_id = self.add_expression(Vec::from(&eh_frame_data
-                                        [e.offset .. e.offset + e.length]));
+                                        [e.offset .. e.offset + e.length]), cb)?;
                                         let expr_id = expr_id as u64;
                                         rs.extend_from_slice(&6u32.to_le_bytes());
                                         rs.extend_from_slice(&expr_id.to_le_bytes());
@@ -239,7 +264,7 @@ impl Ent {
                                         break 'rows;
                                     }
                                     let expr_id = self.add_expression(Vec::from(&eh_frame_data
-                                        [e.offset .. e.offset + e.length]));
+                                        [e.offset .. e.offset + e.length]), cb)?;
                                     rs.extend_from_slice(&7u32.to_le_bytes());
                                     rs.extend_from_slice(&expr_id.to_le_bytes());
                                 }
@@ -273,13 +298,12 @@ impl Ent {
 
                         // get row index or create new
                         let entryid = if let Some(id) = self.unwind_entries_rev.get(&s) {
-                            self.unwind_entry_counts[*id] += 1;
                             *id
                         } else {
-                            let id = self.unwind_entries.len();
-                            self.unwind_entries.insert(id, s.clone());
+                            let id = self.next_entry_id;
+                            self.next_entry_id += 1;
+                            cb(TableType::UnwindEntries, id as u32, &s)?;
                             self.unwind_entries_rev.insert(s, id);
-                            self.unwind_entry_counts.push(1);
                             id
                         };
                         // VMAs are much smaller than 64 bits
@@ -304,32 +328,110 @@ impl Ent {
             }
         }
         warn!("Parsing errors: {:?}", parsing_errors);
-        info!("Unwind entries: {}", self.unwind_entries.len());
+        info!("Unwind entries: {}", self.next_entry_id);
         info!("Unwind table  : {}", unwind_table.len());
-        info!("Expressions   : {}", self.expressions.len());
+        info!("Expressions   : {}", self.next_expression_id);
 
-        self.unwind_tables.push(unwind_table);
+        // convert unwind table to arr with u64 -> u64
+        let mut arr = Vec::with_capacity(unwind_table.len());
+        for (&addr, &entry_opt) in &unwind_table {
+            let entry_id = match entry_opt {
+                Some(eid) => eid,
+                None => 0,             // 0 means end of unwind info
+            };
+            arr.push((addr, entry_id as u64));
+        }
 
-        Ok((oid, parsing_errors))
+        let mut start = 0;
+        while arr.len() > start {
+            // leave 16 bytes to relax bounds checks in eBPF
+            let sz = CHUNK_SIZE - self.current_table.len() - 16;
+            let (table, entries) = table::build(&arr[start..], sz)?;
+            let entry = self.table_mappings.entry(oid).or_default();
+            entry.push((arr[start].0, self.current_table_id, self.current_table.len()));
+            println!("Mapping file offset {:x} to table id {} offset {:x}",
+                arr[start].0, self.current_table_id, self.current_table.len());
+            if self.current_table.is_empty() {
+                self.current_table = table;
+            } else {
+                self.current_table.extend_from_slice(&table);
+            }
+            if self.current_table.len() >= CHUNK_SIZE - 200 {
+                cb(TableType::UnwindTable, self.current_table_id as u32,
+                    &self.current_table)?;
+                self.current_table = Vec::new();
+                self.current_table_id += 1;
+            }
+            start += entries;
+        }
+
+        Ok((oid, parsing_errors, unwind_table))
     }
 
-    // returns vec of (vma_start, file-offset, offsetmap_id, start-in-map)
-    pub fn build_mapping_for_pid(&mut self, pid: u32)
-        -> Result<Vec<u8>>
+    fn add_file_nopush<P: AsRef<std::path::Path>, F: Callback>(&mut self, path: P, cb: &F) ->
+        Result<Option<(usize, Option<(HashMap<ParsingError, u64>, BTreeMap<u64, Option<usize>>)>)>>
     {
-        let Some(maps) = self.pid_map.get(&pid) else {
-            return Err(EntError::PidNotFound);
-        };
+        let path: OsString = path.as_ref().as_os_str().to_os_string();
+        if let Some(r) = self.files_seen.get(&path) {
+            if let Some(oid) = r {
+                return Ok(Some((*oid, None)));
+            }
+            return Ok(None);
+        }
+
+        match self.add_new_file(&path, cb) {
+            Ok((oid, errors, unwind_table)) => {
+                self.files_seen.insert(path, Some(oid));
+                Ok(Some((oid, Some((errors, unwind_table)))))
+            }
+            Err(e) => {
+                self.files_seen.insert(path, None);
+                Err(e)
+            },
+        }
+    }
+
+    pub fn add_file<P: AsRef<std::path::Path>, F: Callback>(&mut self, path: P, cb: &F) ->
+        Result<Option<(usize, Option<(HashMap<ParsingError, u64>, BTreeMap<u64, Option<usize>>)>)>>
+    {
+        let res = self.add_file_nopush(path, cb)?;
+        self.push_current_table(cb)?;
+        Ok(res)
+    }
+
+    fn add_expression<F: Callback>(&mut self, expr: Vec<u8>, cb: &F) -> Result<usize> {
+        debug!("expression: {:?}", expr);
+        if let Some(id) = self.expressions_rev.get(&expr) {
+            Ok(*id)
+        } else {
+            let id = self.next_expression_id;
+            self.next_expression_id += 1;
+            assert!(expr.len() < 256);
+            let mut e = expr.clone();
+            e.extend_from_slice(&[e.len() as u8; 1]);
+            e.extend(vec![0u8; 255 - expr.len()]); // align to 16 bytes
+            cb(TableType::Expressions, id as u32, &e)?;
+
+            self.expressions_rev.insert(expr, id);
+            Ok(id)
+        }
+    }
+
+    pub fn add_pid<F: Callback>(&mut self, pid: u32, cb: &F) -> Result<()> {
+        let maps = read_process_maps(pid)?;
         let mut s = vec![0u8; 8]; // reserve space for number of entries
         let mut num_entries = 0;
-        for map in maps.iter() {
-            let Some(Some(oid)) = self.files_seen.get(&map.file_path) else {
+        for map in &maps {
+            let res = self.add_file(&map.file_path, cb);
+            let Ok(Some((oid, _))) = res else {
+                debug!("File not added: {}, res {:?}", map.file_path, res);
                 continue;
             };
-            let Some(mapping) = self.table_mappings.get(oid) else {
+            let Some(mapping) = self.table_mappings.get(&oid) else {
                 println!("No mapping found for oid {}", oid);
                 break;
             };
+println!("mappings {:x?}", mapping);
             let map_offset_end = map.offset + (map.vm_end - map.vm_start);
             for (file_offset, table_id, table_offset) in mapping.iter() {
                 if *file_offset >= map_offset_end {
@@ -345,6 +447,7 @@ impl Ent {
                 let table_id = *table_id as u32;
                 let table_offset = *table_offset as u32;
 
+println!("Mapping VM {:x} offset {:x} to table id {} offset {:x}", start, offset, table_id, table_offset);
                 s.extend_from_slice(&start.to_le_bytes());
                 s.extend_from_slice(&offset.to_le_bytes());
                 s.extend_from_slice(&table_id.to_le_bytes());
@@ -353,132 +456,28 @@ impl Ent {
                 num_entries += 1;
             }
         }
+        self.push_current_table(cb)?;
         // prepend number of entries
         let num_entries_u64 = num_entries as u64;
         s[0..8].copy_from_slice(&num_entries_u64.to_le_bytes());
         // fill up to expected size
         s.extend(vec![0u8; (MAX_MAPPINGS - num_entries) * 24]);
 
-        Ok(s)
-    }
-
-    pub fn add_pid(&mut self, pid: u32) -> Result<()> {
-        if self.pid_map.contains_key(&pid) {
-            return Ok(());
-        }
-        let maps = read_process_maps(pid)?;
-        for map in &maps {
-            if self.files_seen.contains_key(&map.file_path) {
-                continue;
-            }
-            let res = self.add_file(&map.file_path);
-println!("Adding file: {} result {:?}", map.file_path, res);
-            let oid = match res {
-                Ok((oid, _errors)) => Some(oid),
-                Err(_) => None,
-            };
-            self.files_seen.insert(map.file_path.clone(), oid);
-        }
-        self.pid_map.insert(pid, maps);
+        cb(TableType::Mappings, pid, &s)?;
 
         Ok(())
     }
 
-    fn add_expression(&mut self, expr: Vec<u8>) -> usize {
-        debug!("expression: {:?}", expr);
-        if let Some(id) = self.expressions_rev.get(&expr) {
-            *id
-        } else {
-            let id = self.expressions.len();
-            self.expressions.insert(id, expr.clone());
-            self.expressions_rev.insert(expr, id);
-            id
+    fn push_current_table<F: Callback>(&mut self, cb: &F) -> Result<()> {
+        if !self.current_table.is_empty() {
+            let mut t = self.current_table.clone();
+            t.extend(vec![0u8; CHUNK_SIZE - self.current_table.len()]); // pad end
+            cb(TableType::UnwindTable, self.current_table_id as u32, &t)?;
         }
+        Ok(())
     }
 
-    pub fn build_tables(&mut self)
-        -> Result<(
-             Vec<Vec<u8>>,       // unwind tables
-             Vec<Vec<u8>>,       // unwind entries
-             Vec<Vec<u8>>,       // expressions
-           )>
-    {
-        let mut tables = Vec::new();
-        let mut mappings: HashMap<usize, Vec<(u64, usize, usize)>>  = HashMap::new();
-        let chunk_size = 256 * 1024; // 256 KB per eBPF map entry
-
-        let mut current_table = Vec::new();
-        let mut current_table_id = 0;
-        for (oid, unwind_table) in self.unwind_tables.iter().enumerate() {
-            // convert unwind table to arr with u64 -> u64
-            let mut arr = Vec::with_capacity(unwind_table.len());
-            for (addr, entry_opt) in unwind_table {
-                let entry_id = match entry_opt {
-                    Some(eid) => *eid + 1, // entry ids start at 1
-                    None => 0,             // 0 means end of unwind info
-                };
-                arr.push((*addr, entry_id as u64));
-            }
-            //println!("Final unwind table size: {}", table.len());
-
-            let mut start = 0;
-            while arr.len() > start {
-                let sz = chunk_size - current_table.len() - 16; // leave some space to relax bounds
-                                                                // checks in eBPF
-                let (table, entries) = table::build(&arr[start..], sz)?;
-println!("add mapping: oid {} addr {:x} table id {} offset {}",
-    oid, arr[start].0, current_table_id, current_table.len());
-                let entry = mappings.entry(oid).or_default();
-                entry.push((arr[start].0, current_table_id, current_table.len()));
-                if current_table.is_empty() {
-                    current_table = table;
-                } else {
-                    current_table.extend_from_slice(&table);
-                }
-                if current_table.len() >= chunk_size - 200 {
-                    tables.push(current_table);
-                    current_table = Vec::new();
-                    current_table_id += 1;
-                }
-                start += entries;
-            }
-        }
-
-        if !current_table.is_empty() {
-            current_table.extend(vec![0u8; chunk_size - current_table.len()]); // pad end
-            tables.push(current_table);
-        }
-        println!("Final unwind table size: {} in {} parts",
-            tables.iter().map(|t| t.len()).sum::<usize>(), tables.len());
-        println!("Total .eh_frame size: {}", self.total_eh_frame_size);
-        println!("number of unwind tables: {}", self.unwind_tables.len());
-        println!("Total unwind entries: {}",
-            self.unwind_tables.iter().map(|u| u.len()).sum::<usize>());
-        println!("Unique unwind entries: {}", self.unwind_entries.len());
-
-        let mut entries = Vec::new();
-        entries.push(vec![0u8; CFT_ENTRY_SIZE]); // entry id 0 means no unwind info
-        for (old_id, _) in self.unwind_entries.iter() {
-            let entry = self.unwind_entries.get(old_id).unwrap();
-            entries.push(entry.clone());
-        }
-
-        // XXX TODO: build as vector in the first place
-        let mut exprs = Vec::new();
-        for (id, expr) in self.expressions.iter() {
-            assert_eq!(*id, exprs.len());
-            assert!(expr.len() < 256);
-            let mut e = expr.clone();
-            e.extend_from_slice(&[e.len() as u8; 1]);
-            e.extend(vec![0u8; 255 - expr.len()]); // align to 16 bytes
-            exprs.push(e);
-        }
-
-        self.table_mappings = mappings;
-
-        Ok((tables, entries, exprs))
-    }
-
+    /*
     pub fn lookup(&self, pid: u32, addr: u64) -> Option<(usize, usize)> {
         let Some(maps) = self.pid_map.get(&pid) else {
             return None;
@@ -507,8 +506,8 @@ println!("add mapping: oid {} addr {:x} table id {} offset {}",
         }
         None
     }
+    */
 }
-
 #[derive(Debug)]
 pub struct ProcessMap {
     pub vm_start: u64,
