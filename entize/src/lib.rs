@@ -61,7 +61,7 @@ struct EvaluationContext {
 #[derive(Debug)]
 pub struct Ent {
     unwind_tables: Vec<BTreeMap<u64, Option<usize>>>,
-    unwind_entries: BTreeMap<usize, Vec<u8>>,   // XXX needed? only rev?
+    unwind_entries: BTreeMap<usize, Vec<u8>>,
     unwind_entry_counts: Vec<usize>,
     unwind_entries_rev: BTreeMap<Vec<u8>, usize>,
     expressions: BTreeMap<usize, Vec<u8>>,  // XXX needed? only rev?
@@ -407,18 +407,6 @@ println!("Adding file: {} result {:?}", map.file_path, res);
         let mut mappings: HashMap<usize, Vec<(u64, usize, usize)>>  = HashMap::new();
         let chunk_size = 256 * 1024; // 256 KB per eBPF map entry
 
-        // count occurences of unwind entries and sort them in descending order, so that
-        // the entries with the highest occurences get the lowest ids for a smaller encoding
-        let mut by_count: Vec<(usize, usize)> = self.unwind_entry_counts.iter().enumerate()
-            .map(|(i, c)| (i, *c)).collect();
-        //by_count.sort_by(|a, b| b.1.cmp(&a.1));
-
-        // build map from old entry id to new entry id
-        let mut entry_id_map = vec![0; by_count.len()];
-        for (new_id, (old_id, _count)) in by_count.iter().enumerate() {
-            entry_id_map[*old_id] = new_id;
-        }
-
         let mut current_table = Vec::new();
         let mut current_table_id = 0;
         for (oid, unwind_table) in self.unwind_tables.iter().enumerate() {
@@ -426,8 +414,8 @@ println!("Adding file: {} result {:?}", map.file_path, res);
             let mut arr = Vec::with_capacity(unwind_table.len());
             for (addr, entry_opt) in unwind_table {
                 let entry_id = match entry_opt {
-                    Some(eid) => entry_id_map[*eid] + 1, // entry ids start at 1
-                    None => 0,                           // 0 means end of unwind info
+                    Some(eid) => *eid + 1, // entry ids start at 1
+                    None => 0,             // 0 means end of unwind info
                 };
                 arr.push((*addr, entry_id as u64));
             }
@@ -470,7 +458,7 @@ println!("add mapping: oid {} addr {:x} table id {} offset {}",
 
         let mut entries = Vec::new();
         entries.push(vec![0u8; CFT_ENTRY_SIZE]); // entry id 0 means no unwind info
-        for (old_id, _) in by_count.iter() {
+        for (old_id, _) in self.unwind_entries.iter() {
             let entry = self.unwind_entries.get(old_id).unwrap();
             entries.push(entry.clone());
         }
@@ -495,16 +483,6 @@ println!("add mapping: oid {} addr {:x} table id {} offset {}",
         let Some(maps) = self.pid_map.get(&pid) else {
             return None;
         };
-        let mut by_count: Vec<(usize, usize)> = self.unwind_entry_counts.iter().enumerate()
-            .map(|(i, c)| (i, *c)).collect();
-        //by_count.sort_by(|a, b| b.1.cmp(&a.1));
-
-        // build map from old entry id to new entry id
-        let mut entry_id_map = vec![0; by_count.len()];
-        for (new_id, (old_id, _count)) in by_count.iter().enumerate() {
-            entry_id_map[*old_id] = new_id;
-        }
-
         for map in maps.iter() {
             if addr >= map.vm_start && addr < map.vm_end {
                 let Some(Some(oid)) = self.files_seen.get(&map.file_path) else {
@@ -519,8 +497,8 @@ println!("add mapping: oid {} addr {:x} table id {} offset {}",
                     return None;
                 };
                 let entry_id = match entry_opt {
-                    Some(eid) => entry_id_map[*eid] + 1, // entry ids start at 1
-                    None => 0,                           // 0 means end of unwind info
+                    Some(eid) => *eid + 1, // entry ids start at 1
+                    None => 0,             // 0 means end of unwind info
                 };
                 println!("Found unwind entry id {} for addr {:x}", entry_id, addr);
                 let rules = self.unwind_entries.get(&entry_id)?;
