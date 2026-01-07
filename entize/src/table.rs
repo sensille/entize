@@ -35,9 +35,10 @@ pub(crate) fn build(arr: &[(u64, u64)], max_size: usize) -> Result<(Vec<u8>, usi
             right = entries - 1;
             entries = (entries - adj).max(left);
         } else {
+            result = Some((ctx, entries));
             left = entries;
             entries = (entries + adj).min(right);
-            result = Some((ctx, entries));
+            //result = Some((ctx, entries));
             if diff.abs() < 16.0 {
                 break;
             }

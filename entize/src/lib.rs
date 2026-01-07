@@ -1,5 +1,9 @@
 use object::{Object, ObjectSection};
 use gimli::UnwindSection;
+use gimli::{
+    AttributeValue, DebuggingInformationEntry, Dwarf, EndianSlice, Reader, RunTimeEndian, Unit,
+};
+
 use thiserror::Error;
 use std::collections::{ HashMap, BTreeMap };
 use log::{ debug, info, warn };
@@ -22,6 +26,8 @@ pub enum EntError {
     ObjectParseError(object::Error),
     #[error("No exception handling information in object")]
     NoEhInfo,
+    #[error("No debug information in object")]
+    NoDebugInfo,
     #[error("Dwarf error: bad expression offset")]
     DwarfErrorExpressionOffset,
     #[error("Dwarf error: unknown register rule")]
@@ -83,6 +89,7 @@ pub struct Ent {
     unwind_entries_rev: BTreeMap<Vec<u8>, usize>,
     expressions_rev: BTreeMap<Vec<u8>, usize>,
     total_eh_frame_size: usize,
+    total_debug_info_size: usize,
     table_mappings: HashMap<usize, Vec<(u64, usize, usize)>>, // oid -> ( table id, offset)
     files_seen: HashMap<OsString, Option<usize>>, // file path -> oid
     current_table: Vec<u8>,
@@ -96,6 +103,14 @@ pub enum ParsingError {
     RowOverlap,
 }
 
+struct DwarfCtx<'a, R: gimli::Reader<Offset = usize>, F: Callback> {
+    dwarf: &'a Dwarf<R>,
+    cu: &'a Unit<R>,
+    oid: usize,
+    map_offsets: &'a BTreeMap<u64, i64>,
+    cb: &'a F,
+}
+
 impl Ent {
     pub fn new() -> Self {
         Ent {
@@ -106,55 +121,17 @@ impl Ent {
             unwind_entries_rev: BTreeMap::new(),
             expressions_rev: BTreeMap::new(),
             total_eh_frame_size: 0,
+            total_debug_info_size: 0,
             table_mappings: HashMap::new(),
             files_seen: HashMap::new(),
             current_table: Vec::new(),
         }
     }
 
-
-    // returns (oid, parsing errors, unwind_table)
-    // the returned unwind table is normally not needed, it is returned
-    // so that it is possible to easily build a lookup tool
-    // to aid in debugging
-    fn add_new_file<P: AsRef<std::path::Path>, F: Callback>(&mut self, path: P, cb: &F)
-        -> Result<(usize, HashMap<ParsingError, u64>, BTreeMap<u64, Option<usize>>)>
+    fn read_eh_frame(&mut self, object: &object::File, oid: usize,
+        map_offsets: &BTreeMap<u64, i64>, cb: &impl Callback)
+        -> Result<(HashMap<ParsingError, u64>, BTreeMap<u64, Option<usize>>)>
     {
-        let oid = self.next_oid;
-        if oid == u16::MAX as usize {
-            return Err(TooManyObjects);
-        }
-        if oid == 0 {
-            // first time here, add empty unwind entry at id 0
-            cb(TableType::UnwindEntries, 0, &[0u8; CFT_ENTRY_SIZE])?;
-        }
-        self.next_oid += 1;
-        let file = std::fs::File::open(&path).map_err(FileOpenError)?;
-
-        let mmap = unsafe { memmap2::Mmap::map(&file).map_err(MmapError)? };
-        let object = object::File::parse(&*mmap).map_err(ObjectParseError)?;
-
-        /*
-         * enumerate all sections and store the offset between VMA and file offset
-         */
-        let mut map_offsets: BTreeMap<u64, i64> = BTreeMap::new();
-        for section in object.sections() {
-            let object::SectionFlags::Elf{ sh_flags: flags} = section.flags() else {
-                return Err(UnexpectedObjectType);
-            };
-            if (flags as u32 & object::elf::SHF_ALLOC) == 0 {
-                continue;
-            }
-            let addr = section.address();
-            let Some((offset, _)) = section.file_range() else {
-                continue;
-            };
-            if addr == offset {
-                continue;
-            }
-            map_offsets.insert(addr, addr as i64 - offset as i64);
-        }
-
         let eh_frame_section = object
             .section_by_name(".eh_frame")
             .ok_or(NoEhInfo)?;
@@ -365,6 +342,253 @@ impl Ent {
             start += entries;
         }
 
+        Ok((parsing_errors, unwind_table))
+    }
+
+    fn read_debug_info(&mut self, object: &object::File, oid: usize,
+        map_offsets: &BTreeMap<u64, i64>, cb: &impl Callback)
+        -> Result<()>
+    {
+        // Gimli needs a closure that converts a SectionId (like .debug_info) into a byte slice
+        let load_section = |id: gimli::SectionId| -> Result<std::borrow::Cow<[u8]>> {
+            match object.section_by_name(id.name()) {
+                Some(section) => Ok(section.uncompressed_data().unwrap_or(
+                    std::borrow::Cow::Borrowed(&[]))),
+                None => Ok(std::borrow::Cow::Borrowed(&[])),
+            }
+        };
+
+        let sections = gimli::DwarfSections::load(&load_section)?;
+        let dwarf = sections.borrow(|section|
+            gimli::EndianSlice::new(&*section, gimli::RunTimeEndian::Little));
+
+        // Iterate over Compilation Units (CUs)
+        let mut iter = dwarf.units();
+        while let Some(header) = iter.next().map_err(GimliError)? {
+            let cu = dwarf.unit(header).map_err(GimliError)?;
+            if let Some(name) = cu.name {
+                println!("Unit name: {:?}", name.to_string_lossy());
+            } else {
+                println!("Unit name: <unknown>");
+            }
+            let ctx = DwarfCtx {
+                dwarf: &dwarf,
+                cu: &cu,
+                oid,
+                map_offsets: &map_offsets,
+                cb,
+            };
+            self.handle_unit(&ctx)?;
+        }
+
+        Ok(())
+    }
+
+    fn handle_unit<R, F>(
+        &self,
+        ctx: &DwarfCtx<R, F>,
+    ) -> Result<()>
+        where R: gimli::Reader<Offset = usize>,
+              F: Callback,
+    {
+        let mut tree = ctx.cu.entries_tree(None).map_err(GimliError)?;
+        let root = tree.root().map_err(GimliError)?;
+        let entry = root.entry();
+        match entry.tag() {
+            gimli::DW_TAG_compile_unit | gimli::DW_TAG_partial_unit => (),
+            gimli::DW_TAG_type_unit => {
+                panic!("Type units not supported yet");
+            }
+            _ => {
+                panic!("Unexpected root tag: {:?}", entry.tag().static_string());
+            }
+        }
+
+        /*
+        ...
+        */
+        self.recurse_children(ctx, root, 0)?;
+
+        Ok(())
+    }
+
+    fn recurse_children<R, F>(
+        &self,
+        ctx: &DwarfCtx<R, F>,
+        node: gimli::EntriesTreeNode<R>,
+        depth: usize,
+    ) -> Result<()>
+        where R: gimli::Reader<Offset = usize>,
+              F: Callback,
+    {
+        let mut children = node.children();
+        while let Some(child) = children.next().map_err(GimliError)? {
+            self.handle_node(ctx, child, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    fn handle_node<R, F>(
+        &self,
+        ctx: &DwarfCtx<R, F>,
+        node: gimli::EntriesTreeNode<R>,
+        depth: usize,
+    ) -> Result<()>
+        where R: gimli::Reader<Offset = usize>,
+              F: Callback,
+    {
+        let entry = node.entry();
+        let indent = "    ".repeat(depth);
+        println!("{}Entry: tag {:?} code {:?} ", indent, entry.tag().static_string(), entry.code());
+        match entry.tag() {
+            gimli::DW_TAG_imported_unit |
+            gimli::DW_TAG_imported_module => {
+                // XXX
+                return Ok(());
+            }
+            gimli::DW_TAG_subprogram |
+            gimli::DW_TAG_inlined_subroutine => {
+                self.dump_attrs(ctx, entry, depth)?;
+                return self.recurse_children(ctx, node, depth);
+            }
+            gimli::DW_TAG_dwarf_procedure => {
+                return Ok(());
+            }
+            gimli::DW_TAG_base_type |
+            gimli::DW_TAG_class_type |
+            gimli::DW_TAG_structure_type |
+            gimli::DW_TAG_typedef |
+            gimli::DW_TAG_pointer_type |
+            gimli::DW_TAG_subroutine_type |
+            gimli::DW_TAG_const_type |
+            gimli::DW_TAG_reference_type |
+            gimli::DW_TAG_rvalue_reference_type |
+            gimli::DW_TAG_union_type |
+            gimli::DW_TAG_enumeration_type |
+            gimli::DW_TAG_array_type |
+            gimli::DW_TAG_volatile_type |
+            gimli::DW_TAG_restrict_type |
+            gimli::DW_TAG_atomic_type |
+            gimli::DW_TAG_ptr_to_member_type => {
+                return Ok(());
+            }
+            gimli::DW_TAG_imported_declaration => {
+                return Ok(());
+            }
+            gimli::DW_TAG_variable => {
+                return Ok(());
+            }
+            // HERE
+            gimli::DW_TAG_formal_parameter => {
+                return Ok(());
+            }
+            gimli::DW_TAG_unspecified_parameters => {
+                return Ok(());
+            }
+            gimli::DW_TAG_template_type_parameter => {
+                return Ok(());
+            }
+            gimli::DW_TAG_template_value_parameter => {
+                return Ok(());
+            }
+            gimli::DW_TAG_lexical_block => {
+                return Ok(());
+            }
+            gimli::DW_TAG_GNU_template_parameter_pack |
+            gimli::DW_TAG_GNU_formal_parameter_pack |
+            gimli::DW_TAG_GNU_template_template_param => {
+                return Ok(());
+            }
+            gimli::DW_TAG_label => {
+                return Ok(());
+            }
+            // HERE
+            gimli::DW_TAG_call_site => {
+                return Ok(());
+            }
+            gimli::DW_TAG_namespace => {
+                self.dump_attrs(ctx, entry, depth)?;
+                return self.recurse_children(ctx, node, depth);
+            }
+            _ => panic!("Unhandled tag: {:?}", entry.tag().static_string()),
+        }
+    }
+
+    fn dump_attrs<R, F>(
+        &self,
+        ctx: &DwarfCtx<R, F>,
+        entry: &DebuggingInformationEntry<R>,
+        depth: usize,
+    ) -> Result<()>
+        where R: gimli::Reader<Offset = usize>,
+                F: Callback,
+    {
+        let mut attrs = entry.attrs();
+        let indent = "    ".repeat(depth);
+        while let Some(attr) = attrs.next().map_err(GimliError)? {
+            // Process attributes as needed
+            // For example, print attribute names and values
+            println!("{}  Attr: {:?}({:?}) = {:?}", indent, attr.name(), attr.name().static_string(), attr.value());
+            match attr.name() {
+                gimli::DW_AT_name => {
+                    if let Ok(s) = ctx.dwarf.attr_string(ctx.cu, attr.value()) {
+                        if let Ok(s_cow) = s.to_string_lossy() {
+                           println!("{}        --> \"{}\"", indent, s_cow);
+                        }
+                    }
+                }
+                _ => (),
+            }
+        }
+        Ok(())
+    }
+
+    // returns (oid, parsing errors, unwind_table)
+    // the returned unwind table is normally not needed, it is returned
+    // so that it is possible to easily build a lookup tool
+    // to aid in debugging
+    fn add_new_file<P: AsRef<std::path::Path>, F: Callback>(&mut self, path: P, cb: &F)
+        -> Result<(usize, HashMap<ParsingError, u64>, BTreeMap<u64, Option<usize>>)>
+    {
+        let oid = self.next_oid;
+        if oid == u16::MAX as usize {
+            return Err(TooManyObjects);
+        }
+        if oid == 0 {
+            // first time here, add empty unwind entry at id 0
+            cb(TableType::UnwindEntries, 0, &[0u8; CFT_ENTRY_SIZE])?;
+        }
+        self.next_oid += 1;
+        let file = std::fs::File::open(&path).map_err(FileOpenError)?;
+
+        let mmap = unsafe { memmap2::Mmap::map(&file).map_err(MmapError)? };
+        let object = object::File::parse(&*mmap).map_err(ObjectParseError)?;
+
+        /*
+         * enumerate all sections and store the offset between VMA and file offset
+         */
+        let mut map_offsets: BTreeMap<u64, i64> = BTreeMap::new();
+        for section in object.sections() {
+            let object::SectionFlags::Elf{ sh_flags: flags} = section.flags() else {
+                return Err(UnexpectedObjectType);
+            };
+            if (flags as u32 & object::elf::SHF_ALLOC) == 0 {
+                continue;
+            }
+            let addr = section.address();
+            let Some((offset, _)) = section.file_range() else {
+                continue;
+            };
+            if addr == offset {
+                continue;
+            }
+            map_offsets.insert(addr, addr as i64 - offset as i64);
+        }
+
+        let (parsing_errors, unwind_table) = self.read_eh_frame(&object, oid, &map_offsets, cb)?;
+
+        self.read_debug_info(&object, oid, &map_offsets, cb)?;
+
         Ok((oid, parsing_errors, unwind_table))
     }
 
@@ -508,6 +732,7 @@ println!("Mapping VM {:x} offset {:x} to table id {} offset {:x}", start, offset
     }
     */
 }
+
 #[derive(Debug)]
 pub struct ProcessMap {
     pub vm_start: u64,
